@@ -48,6 +48,8 @@ def build_sla_data_quality_summary(spark: SparkSession) -> None:
             to_date(MAX(CASE WHEN status = 'VALID' THEN data_date ELSE NULL END))
         ) AS freshness_lag_days,
         ROUND(AVG(CAST(attempt_count AS DOUBLE)), 2) AS avg_attempts_per_day,
+        ROUND(AVG(unit_cost_ms_per_item), 3) AS avg_unit_cost_ms_per_item,
+        ROUND(SUM(COALESCE(payload_bytes, 0)) / 1048576.0, 2) AS total_payload_mb,
         CASE
             WHEN SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) > 0 THEN 'DEGRADED'
             WHEN datediff(

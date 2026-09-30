@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 from pyspark.sql import SparkSession
-from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
 
 
 BRONZE_NAMESPACE = "nessie.bronze"
@@ -28,9 +28,18 @@ INGESTION_LOG_SCHEMA = StructType([
     StructField("expected_items", IntegerType(), True),
     StructField("actual_items", IntegerType(), True),
     StructField("attempt_count", IntegerType(), False),
+    StructField("request_latency_ms", IntegerType(), True),
+    StructField("payload_bytes", IntegerType(), True),
+    StructField("unit_cost_ms_per_item", DoubleType(), True),
     StructField("note", StringType(), True),
     StructField("checked_at", StringType(), False),
 ])
+
+INGESTION_LOG_COST_COLUMNS = (
+    ("request_latency_ms", "INT"),
+    ("payload_bytes", "INT"),
+    ("unit_cost_ms_per_item", "DOUBLE"),
+)
 
 
 def ensure_ingestion_log_table(
@@ -50,6 +59,9 @@ def ensure_ingestion_log_table(
                 expected_items INT,
                 actual_items INT,
                 attempt_count INT,
+                request_latency_ms INT,
+                payload_bytes INT,
+                unit_cost_ms_per_item DOUBLE,
                 note STRING,
                 checked_at STRING
             )
@@ -57,6 +69,15 @@ def ensure_ingestion_log_table(
             PARTITIONED BY (source_name)
             """
         )
+    else:
+        existing_cols = {f.name for f in spark.table(log_table).schema.fields}
+        missing = [
+            f"{col_name} {col_type}"
+            for col_name, col_type in INGESTION_LOG_COST_COLUMNS
+            if col_name not in existing_cols
+        ]
+        if missing:
+            spark.sql(f"ALTER TABLE {log_table} ADD COLUMNS ({', '.join(missing)})")
 
 
 def get_dates_to_crawl(
@@ -153,6 +174,27 @@ def merge_ingestion_log(
     deduped: dict[tuple[str, str], dict] = {}
     for item in log_rows:
         key = (str(item["source_name"]), str(item["data_date"]))
+        actual_val = (
+            int(item["actual_items"])
+            if item.get("actual_items") is not None
+            else 0
+        )
+        latency_val = (
+            int(item["request_latency_ms"])
+            if item.get("request_latency_ms") is not None
+            else None
+        )
+        bytes_val = (
+            int(item["payload_bytes"])
+            if item.get("payload_bytes") is not None
+            else None
+        )
+        unit_cost_val = item.get("unit_cost_ms_per_item")
+        if unit_cost_val is None and latency_val is not None and actual_val > 0:
+            unit_cost_val = round(float(latency_val) / float(actual_val), 4)
+        elif unit_cost_val is not None:
+            unit_cost_val = float(unit_cost_val)
+
         normalized = {
             "source_name": str(item["source_name"]),
             "data_date": str(item["data_date"]),
@@ -164,12 +206,11 @@ def merge_ingestion_log(
                 if item.get("expected_items") is not None
                 else None
             ),
-            "actual_items": (
-                int(item["actual_items"])
-                if item.get("actual_items") is not None
-                else 0
-            ),
+            "actual_items": actual_val,
             "attempt_count": int(item.get("attempt_count", 1)),
+            "request_latency_ms": latency_val,
+            "payload_bytes": bytes_val,
+            "unit_cost_ms_per_item": unit_cost_val,
             "note": item.get("note"),
             "checked_at": str(item["checked_at"]),
         }
@@ -202,6 +243,9 @@ def merge_ingestion_log(
             t.expected_items = s.expected_items,
             t.actual_items = s.actual_items,
             t.attempt_count = COALESCE(t.attempt_count, 0) + 1,
+            t.request_latency_ms = COALESCE(s.request_latency_ms, t.request_latency_ms),
+            t.payload_bytes = COALESCE(s.payload_bytes, t.payload_bytes),
+            t.unit_cost_ms_per_item = COALESCE(s.unit_cost_ms_per_item, t.unit_cost_ms_per_item),
             t.note = s.note,
             t.checked_at = s.checked_at
     WHEN MATCHED AND s.status <> 'VALID' THEN
@@ -218,6 +262,9 @@ def merge_ingestion_log(
             t.expected_items = COALESCE(s.expected_items, t.expected_items),
             t.actual_items = s.actual_items,
             t.attempt_count = COALESCE(t.attempt_count, 0) + 1,
+            t.request_latency_ms = COALESCE(s.request_latency_ms, t.request_latency_ms),
+            t.payload_bytes = COALESCE(s.payload_bytes, t.payload_bytes),
+            t.unit_cost_ms_per_item = COALESCE(s.unit_cost_ms_per_item, t.unit_cost_ms_per_item),
             t.note = s.note,
             t.checked_at = s.checked_at
     WHEN NOT MATCHED THEN
@@ -230,6 +277,9 @@ def merge_ingestion_log(
             expected_items,
             actual_items,
             attempt_count,
+            request_latency_ms,
+            payload_bytes,
+            unit_cost_ms_per_item,
             note,
             checked_at
         )
@@ -249,6 +299,9 @@ def merge_ingestion_log(
             s.expected_items,
             s.actual_items,
             COALESCE(s.attempt_count, 1),
+            s.request_latency_ms,
+            s.payload_bytes,
+            s.unit_cost_ms_per_item,
             s.note,
             s.checked_at
         )
