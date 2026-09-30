@@ -1,0 +1,8 @@
+apache-airflow-providers-apache-spark==6.3.2
+apache-airflow-providers-trino
+pyspark==4.1.3
+pyspark-client==4.1.3
+requests==2.34.2
+trino
+--only-binary=lxml
+lxml==6.1.3

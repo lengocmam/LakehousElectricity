@@ -1,0 +1,308 @@
+name: ${COMPOSE_PROJECT_NAME:-lakehouse}
+
+x-airflow-build: &airflow-build
+  context: .
+  dockerfile: infra/docker/airflow/Dockerfile
+  args:
+    AIRFLOW_IMAGE: ${AIRFLOW_IMAGE:-apache/airflow:3.3.1-python3.10}
+
+x-airflow-common: &airflow-common
+  image: lakehouse-airflow:3.3.1-python3.10
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-2MYa4t2qTlYnLWvH9voP3_h4U1FCRsPcpK_EacA9cHY=}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_API_AUTH_JWT_SECRET:-RlUjGWNGavpTq_9nDgqs-hIynVtYAJ76rOYV8OfbJXmL8BachrFfkvRSb9IAN2c_}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
+    AIRFLOW_CONN_TRINO_DEFAULT: trino://trino@trino:8080/iceberg
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    AWS_REGION: us-east-1
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./scripts/spark:/opt/lakehouse/scripts/spark:ro
+  depends_on: &airflow-common-depends-on
+    postgres-init:
+      condition: service_completed_successfully
+
+x-spark-common: &spark-common
+  image: ${SPARK_IMAGE:-apache/spark:4.1.3-scala2.13-java17-python3-ubuntu}
+  user: root
+  environment:
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    AWS_REGION: us-east-1
+  volumes:
+    - ./config/spark:/opt/spark/conf:ro
+    - ./scripts/spark:/opt/lakehouse/scripts/spark:ro
+    - spark-ivy:/tmp/.ivy2
+  depends_on:
+    minio-init:
+      condition: service_completed_successfully
+    nessie:
+      condition: service_started
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-postgres}
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER:-airflow}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      METABASE_DB_USER: ${METABASE_DB_USER:-metabase}
+      METABASE_DB_PASSWORD: ${METABASE_DB_PASSWORD:-metabase}
+      NESSIE_DB_USER: ${NESSIE_DB_USER:-nessie}
+      NESSIE_DB_PASSWORD: ${NESSIE_DB_PASSWORD:-nessie}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  postgres-init:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD:-postgres}
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER:-airflow}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      METABASE_DB_USER: ${METABASE_DB_USER:-metabase}
+      METABASE_DB_PASSWORD: ${METABASE_DB_PASSWORD:-metabase}
+      NESSIE_DB_USER: ${NESSIE_DB_USER:-nessie}
+      NESSIE_DB_PASSWORD: ${NESSIE_DB_PASSWORD:-nessie}
+    volumes:
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sh /docker-entrypoint-initdb.d/01-init-databases.sh"]
+    restart: "no"
+
+  minio:
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:latest}
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-quay.io/minio/mc:latest}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set lakehouse http://minio:9000 "${MINIO_ROOT_USER:-minioadmin}" "${MINIO_ROOT_PASSWORD:-minioadmin}"
+        mc mb --ignore-existing lakehouse/warehouse
+        mc anonymous set none lakehouse/warehouse
+    restart: "no"
+
+  nessie:
+    image: ${NESSIE_IMAGE:-ghcr.io/projectnessie/nessie:0.108.4}
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      - nessie.version.store.type=JDBC2
+      - nessie.version.store.persist.jdbc.datasource=postgresql
+      - quarkus.datasource.postgresql.db-kind=postgresql
+      - quarkus.datasource.postgresql.jdbc.url=jdbc:postgresql://postgres:5432/nessie
+      - quarkus.datasource.postgresql.username=${NESSIE_DB_USER:-nessie}
+      - quarkus.datasource.postgresql.password=${NESSIE_DB_PASSWORD:-nessie}
+      - nessie.server.authentication.enabled=false
+      - nessie.catalog.default-warehouse=warehouse
+      - nessie.catalog.warehouses.warehouse.location=s3://warehouse/
+      - nessie.catalog.object-stores.health-check.enabled=true
+      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.path-style-access=true
+      - nessie.catalog.service.s3.default-options.endpoint=http://minio:9000/
+      - nessie.catalog.service.s3.default-options.request-signing-enabled=false
+      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      - nessie.catalog.secrets.access-key.name=${MINIO_ROOT_USER:-minioadmin}
+      - nessie.catalog.secrets.access-key.secret=${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "19120:19120"
+      - "19121:9000"
+    restart: unless-stopped
+
+  spark-master:
+    <<: *spark-common
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    restart: unless-stopped
+
+  spark-worker:
+    <<: *spark-common
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+      - --cores
+      - "${SPARK_WORKER_CORES:-2}"
+      - --memory
+      - "${SPARK_WORKER_MEMORY:-2G}"
+    ports:
+      - "8083:8081"
+    depends_on:
+      spark-master:
+        condition: service_started
+    restart: unless-stopped
+
+  spark-sql:
+    <<: *spark-common
+    profiles: ["tools"]
+    entrypoint: ["/opt/spark/bin/spark-sql"]
+    command: []
+    depends_on:
+      spark-worker:
+        condition: service_started
+    stdin_open: true
+    tty: true
+
+  trino:
+    image: ${TRINO_IMAGE:-trinodb/trino:483}
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      nessie:
+        condition: service_started
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./config/trino:/etc/trino:ro
+      - trino-data:/data/trino
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    build: *airflow-build
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  metabase:
+    image: ${METABASE_IMAGE:-metabase/metabase:v0.63.17}
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+      trino:
+        condition: service_started
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_HOST: postgres
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${METABASE_DB_USER:-metabase}
+      MB_DB_PASS: ${METABASE_DB_PASSWORD:-metabase}
+      MB_SITE_NAME: ${METABASE_SITE_NAME:-Lakehouse}
+      MB_ANON_TRACKING_ENABLED: "false"
+      MB_AI_FEATURES_ENABLED: "false"
+      MB_METABOT_ENABLED: "false"
+      MB_SESSION_SECRET_KEY: ${METABASE_SESSION_SECRET_KEY}
+      JAVA_TOOL_OPTIONS: "${METABASE_JAVA_TOOL_OPTIONS:--Xmx512m}"
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail -I http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  minio-data:
+  spark-ivy:
+  trino-data:

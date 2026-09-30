@@ -1,0 +1,7 @@
+.env
+airflow/logs/*
+!airflow/logs/.gitkeep
+__pycache__/
+.pytest_cache/
+*.pyc
+
