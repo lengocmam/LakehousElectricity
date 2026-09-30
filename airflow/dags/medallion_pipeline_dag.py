@@ -119,6 +119,32 @@ with DAG(
             verbose=True,
         )
 
+    transform_silver = SparkSubmitOperator(
+        task_id="transform_silver",
+        application=f"{SPARK_APP_DIR}/silver/transform_silver.py",
+        conn_id="spark_default",
+        name="transform_silver",
+        conf=SPARK_CONF,
+        packages=ICEBERG_PACKAGES,
+        env_vars=SPARK_ENV,
+        **SPARK_RESOURCES,
+        execution_timeout=timedelta(minutes=30),
+        verbose=True,
+    )
+
+    build_gold_signals = SparkSubmitOperator(
+        task_id="build_gold_signals",
+        application=f"{SPARK_APP_DIR}/gold/build_gold_signals.py",
+        conn_id="spark_default",
+        name="build_gold_signals",
+        conf=SPARK_CONF,
+        packages=ICEBERG_PACKAGES,
+        env_vars=SPARK_ENV,
+        **SPARK_RESOURCES,
+        execution_timeout=timedelta(minutes=20),
+        verbose=True,
+    )
+
     end = EmptyOperator(task_id="end")
 
-    start >> bronze_ingestion >> end
+    start >> bronze_ingestion >> transform_silver >> build_gold_signals >> end
