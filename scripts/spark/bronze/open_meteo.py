@@ -1,13 +1,18 @@
+import json
+import random
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-import random
 from zoneinfo import ZoneInfo
-import time
 
 import requests
 
-from bronze.bronze_utils import write_raw_bronze
+from bronze.bronze_utils import (
+    get_dates_to_crawl,
+    merge_ingestion_log,
+    write_raw_bronze,
+)
 from utils.spark import create_spark_session
 
 
@@ -25,6 +30,7 @@ VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 START_DATE_DEFAULT = date(2023, 5, 28)
 REQUEST_WINDOW_DAYS = 14
+RECENT_RECHECK_DAYS = 7
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2
 DEFAULT_429_WAIT_SECONDS = 60
@@ -67,6 +73,8 @@ LOCATIONS = [
     {"location_name": "An Giang", "latitude": 10.0125, "longitude": 105.0809},
     {"location_name": "Ca Mau", "latitude": 9.1527, "longitude": 105.1961},
 ]
+
+EXPECTED_ITEMS_PER_DAY = len(LOCATIONS) * 24  # 34 locations * 24 hours = 816
 
 LATITUDES = ",".join(
     str(location["latitude"])
@@ -118,6 +126,103 @@ def create_open_meteo_session() -> requests.Session:
     return session
 
 
+def build_request_windows(
+    dates_to_crawl: list[date],
+    max_window_days: int = REQUEST_WINDOW_DAYS,
+) -> list[tuple[date, date]]:
+    """
+    Gom danh sách ngày cần cào thành các cửa sổ tối đa `max_window_days` ngày
+    để tối ưu số lượng HTTP request gọi tới Open-Meteo Archive API.
+    """
+    if not dates_to_crawl:
+        return []
+
+    sorted_dates = sorted(set(dates_to_crawl))
+    windows: list[tuple[date, date]] = []
+    win_start = sorted_dates[0]
+    win_end = sorted_dates[0]
+
+    for current in sorted_dates[1:]:
+        if (current - win_start).days < max_window_days:
+            win_end = current
+        else:
+            windows.append((win_start, win_end))
+            win_start = current
+            win_end = current
+
+    windows.append((win_start, win_end))
+    return windows
+
+
+def validate_open_meteo_raw(
+    raw_text: str,
+    window_start_date: date,
+    window_end_date: date,
+    bronze_key: str,
+    batch_id: str,
+    checked_at: str,
+) -> list[dict]:
+    """
+    Kiểm tra trực tiếp trên JSON raw của Open-Meteo:
+    - Duyệt qua từng ngày d trong [window_start_date, window_end_date].
+    - Kỳ vọng chuẩn: 34 tỉnh * 24 giờ = 816 giá trị `temperature_2m != None`.
+    - Đánh giá:
+      * actual_items == 816 -> VALID
+      * 0 < actual_items < 816 -> INCOMPLETE
+      * actual_items == 0 -> EMPTY
+    """
+    payload = json.loads(raw_text)
+    location_items = payload if isinstance(payload, list) else [payload]
+
+    actual_counts: dict[str, int] = {}
+    span_days = (window_end_date - window_start_date).days + 1
+    for offset in range(span_days):
+        d_str = (window_start_date + timedelta(days=offset)).isoformat()
+        actual_counts[d_str] = 0
+
+    for loc_obj in location_items:
+        hourly = loc_obj.get("hourly") or {}
+        times = hourly.get("time") or []
+        temps = hourly.get("temperature_2m") or []
+        for ts_str, temp_val in zip(times, temps):
+            if not ts_str:
+                continue
+            d_str = str(ts_str)[:10]
+            if d_str in actual_counts and temp_val is not None:
+                actual_counts[d_str] += 1
+
+    log_rows: list[dict] = []
+    for offset in range(span_days):
+        d_str = (window_start_date + timedelta(days=offset)).isoformat()
+        actual = actual_counts.get(d_str, 0)
+        if actual >= EXPECTED_ITEMS_PER_DAY:
+            status = "VALID"
+        elif actual > 0:
+            status = "INCOMPLETE"
+        else:
+            status = "EMPTY"
+
+        log_rows.append(
+            {
+                "source_name": SOURCE_NAME,
+                "data_date": d_str,
+                "bronze_key": bronze_key if actual > 0 else None,
+                "batch_id": batch_id,
+                "status": status,
+                "expected_items": EXPECTED_ITEMS_PER_DAY,
+                "actual_items": actual,
+                "attempt_count": 1,
+                "note": (
+                    f"{actual}/{EXPECTED_ITEMS_PER_DAY} valid temperature_2m "
+                    f"across {len(location_items)} locations"
+                ),
+                "checked_at": checked_at,
+            }
+        )
+
+    return log_rows
+
+
 def get_retry_after_seconds(response: requests.Response) -> float | None:
     retry_after = response.headers.get("Retry-After")
 
@@ -139,7 +244,7 @@ def get_retry_after_seconds(response: requests.Response) -> float | None:
             )
         except (TypeError, ValueError):
             return None
-        
+
 
 def fetch_open_meteo(
     window_start_date: date,
@@ -149,10 +254,11 @@ def fetch_open_meteo(
     batch_id: str,
     task_index: int,
     session: requests.Session,
-) -> tuple[dict | None, tuple[date, str] | None]:
+) -> tuple[dict | None, list[dict], tuple[date, str] | None]:
 
     window_start_date_str = window_start_date.isoformat()
     window_end_date_str = window_end_date.isoformat()
+    checked_at = ingestion_timestamp.isoformat()
 
     params = {
         "latitude": LATITUDES,
@@ -183,7 +289,7 @@ def fetch_open_meteo(
                 error_message = f"HTTP 429: {response.text}"
 
                 if attempt == MAX_RETRIES - 1:
-                    return None, (window_start_date, error_message)
+                    return None, [], (window_start_date, error_message)
 
                 retry_after_seconds = get_retry_after_seconds(response)
                 wait_seconds = (
@@ -216,29 +322,47 @@ def fetch_open_meteo(
                     f"Unexpected Content-Type: {content_type}"
                 )
 
+            bronze_key = f"{batch_id}_{task_index:06d}"
+
+            window_log_rows = validate_open_meteo_raw(
+                raw_text=response.text,
+                window_start_date=window_start_date,
+                window_end_date=window_end_date,
+                bronze_key=bronze_key,
+                batch_id=batch_id,
+                checked_at=checked_at,
+            )
+
+            valid_days = sum(1 for r in window_log_rows if r["status"] == "VALID")
+            incomplete_days = sum(1 for r in window_log_rows if r["status"] == "INCOMPLETE")
+            empty_days = sum(1 for r in window_log_rows if r["status"] == "EMPTY")
+            print(
+                f"  -> Validation summary for {window_start_date_str}..{window_end_date_str}: "
+                f"VALID={valid_days}, INCOMPLETE={incomplete_days}, EMPTY={empty_days}"
+            )
+
             record = {
-                "bronze_key": f"{batch_id}_{task_index:06d}",
+                "bronze_key": bronze_key,
                 "source_name": SOURCE_NAME,
                 "source_url": response.url,
                 "source_data_start_date": window_start_date_str,
                 "source_data_end_date": window_end_date_str,
                 "batch_id": batch_id,
-                "ingestion_timestamp": (
-                    ingestion_timestamp.isoformat()
-                ),
+                "ingestion_timestamp": checked_at,
                 "ingest_date": ingest_date,
                 "raw": response.text,
             }
 
-            return record, None
+            return record, window_log_rows, None
 
         except (
             requests.RequestException,
             RuntimeError,
+            ValueError,
         ) as exc:
 
             if attempt == MAX_RETRIES - 1:
-                return None, (
+                return None, [], (
                     window_start_date,
                     str(exc),
                 )
@@ -255,60 +379,32 @@ def fetch_open_meteo(
 
             time.sleep(wait_seconds)
 
-    return None, (
+    return None, [], (
         window_start_date,
         "Max retries exceeded",
     )
-    
 
-def crawl_open_meteo_dates(
-    start_date: date,
-    end_date: date,
+
+def crawl_open_meteo_windows(
+    windows: list[tuple[date, date]],
     ingestion_timestamp: datetime,
     ingest_date: str,
     batch_id: str,
-) -> tuple[list[dict], list[tuple[date, str]]]:
+) -> tuple[list[dict], list[dict], list[tuple[date, str]]]:
 
-    records = []
-    failed_dates = []
+    records: list[dict] = []
+    log_rows: list[dict] = []
+    failed_dates: list[tuple[date, str]] = []
 
-    total_dates = (
-        end_date - start_date
-    ).days + 1
-
-    total_requests = (
-        total_dates + REQUEST_WINDOW_DAYS - 1
-    ) // REQUEST_WINDOW_DAYS
-
-    print(
-        f"Total dates: {total_dates}"
-    )
-
-    print(
-        f"Total API requests: {total_requests}"
-    )
-
-    print(
-        f"Locations per request: {len(LOCATIONS)}"
-    )
+    total_requests = len(windows)
+    print(f"Total API request windows: {total_requests}")
+    print(f"Locations per request: {len(LOCATIONS)}")
 
     session = create_open_meteo_session()
-
     completed_requests = 0
 
     try:
-
-        window_start_date = start_date
-
-        while window_start_date <= end_date:
-
-            window_end_date = min(
-                window_start_date + timedelta(
-                    days=REQUEST_WINDOW_DAYS - 1
-                ),
-                end_date,
-            )
-
+        for window_start_date, window_end_date in windows:
             print(
                 f"\n===== WINDOW: "
                 f"{window_start_date.isoformat()} "
@@ -317,7 +413,7 @@ def crawl_open_meteo_dates(
 
             task_index = completed_requests + 1
 
-            record, error = fetch_open_meteo(
+            record, window_logs, error = fetch_open_meteo(
                 window_start_date=window_start_date,
                 window_end_date=window_end_date,
                 ingestion_timestamp=ingestion_timestamp,
@@ -331,27 +427,37 @@ def crawl_open_meteo_dates(
 
             if record is not None:
                 records.append(record)
+            if window_logs:
+                log_rows.extend(window_logs)
 
             if error is not None:
                 failed_dates.append(error)
+                span_days = (window_end_date - window_start_date).days + 1
+                for offset in range(span_days):
+                    d_str = (window_start_date + timedelta(days=offset)).isoformat()
+                    log_rows.append(
+                        {
+                            "source_name": SOURCE_NAME,
+                            "data_date": d_str,
+                            "bronze_key": None,
+                            "batch_id": batch_id,
+                            "status": "FAILED",
+                            "expected_items": EXPECTED_ITEMS_PER_DAY,
+                            "actual_items": 0,
+                            "attempt_count": 1,
+                            "note": f"Request failed: {error[1][:200]}",
+                            "checked_at": ingestion_timestamp.isoformat(),
+                        }
+                    )
                 break
 
-            print(
-                f"Progress: "
-                f"{completed_requests}/"
-                f"{total_requests}"
-            )
-
-            window_start_date = window_end_date + timedelta(days=1)
+            print(f"Progress: {completed_requests}/{total_requests}")
 
     finally:
         session.close()
 
-    records.sort(
-        key=lambda x: x["bronze_key"]
-    )
-
-    return records, failed_dates
+    records.sort(key=lambda x: x["bronze_key"])
+    return records, log_rows, failed_dates
 
 
 def ensure_open_meteo_date_columns(spark) -> None:
@@ -423,69 +529,75 @@ def main() -> None:
     print(f"ingest_date: {ingest_date}")
     print(f"Locations per API request: {len(LOCATIONS)}")
 
-    # Crawl full range
     start_date = START_DATE_DEFAULT
-
-    end_date = (
-        datetime.now(VN_TZ).date()
-        - timedelta(days=1)
-    )
+    end_date = datetime.now(VN_TZ).date() - timedelta(days=1)
 
     print(
-        f"Dataset date range: "
-        f"{start_date.isoformat()} "
-        f"to {end_date.isoformat()}"
+        f"Target dataset date range: "
+        f"{start_date.isoformat()} to {end_date.isoformat()}"
     )
 
     if start_date > end_date:
         print("No dates to crawl.")
         return
 
-    records, failed_dates = crawl_open_meteo_dates(
-        start_date=start_date,
-        end_date=end_date,
-        ingestion_timestamp=ingestion_timestamp,
-        ingest_date=ingest_date,
-        batch_id=batch_id,
-    )
-
-    if failed_dates:
-
-        print(
-            "\n=== SUMMARY OF FAILED REQUESTS ==="
-        )
-
-        for failed_date, error_message in failed_dates:
-            print(
-                f"- {failed_date.isoformat()}: "
-                f"{error_message}"
-            )
-
-        print(
-            "===================================\n"
-        )
-
-        raise RuntimeError(
-            f"Open-Meteo ingestion failed for "
-            f"{len(failed_dates)} request window(s)."
-        )
-
     spark = None
 
     try:
+        spark = create_spark_session("ingest_open_meteo")
 
-        spark = create_spark_session(
-            "ingest_open_meteo"
+        dates_to_crawl = get_dates_to_crawl(
+            spark=spark,
+            source_name=SOURCE_NAME,
+            start_date=start_date,
+            end_date=end_date,
+            recent_days=RECENT_RECHECK_DAYS,
         )
 
-        write_bronze(
-            spark,
-            records,
-            ingest_date,
+        if not dates_to_crawl:
+            print("All dates in range are already VALID or EXHAUSTED. Nothing to crawl.")
+            return
+
+        windows = build_request_windows(
+            dates_to_crawl,
+            max_window_days=REQUEST_WINDOW_DAYS,
         )
+
+        print(
+            f"Dates needing crawl/re-check: {len(dates_to_crawl)} day(s) "
+            f"grouped into {len(windows)} request window(s)."
+        )
+
+        records, log_rows, failed_dates = crawl_open_meteo_windows(
+            windows=windows,
+            ingestion_timestamp=ingestion_timestamp,
+            ingest_date=ingest_date,
+            batch_id=batch_id,
+        )
+
+        if records:
+            write_bronze(
+                spark,
+                records,
+                ingest_date,
+            )
+
+        if log_rows:
+            merge_ingestion_log(
+                spark=spark,
+                log_rows=log_rows,
+            )
+
+        if failed_dates:
+            print("\n=== SUMMARY OF FAILED REQUESTS ===")
+            for failed_date, error_message in failed_dates:
+                print(f"- {failed_date.isoformat()}: {error_message}")
+            print("===================================\n")
+            raise RuntimeError(
+                f"Open-Meteo ingestion failed for {len(failed_dates)} request window(s)."
+            )
 
     finally:
-
         if spark is not None:
             spark.stop()
 
