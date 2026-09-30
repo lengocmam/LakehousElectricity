@@ -1,0 +1,66 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: iceberg
+    schema: bronze
+    tables:
+      - name: ingestion_log
+        description: "Bảng kiểm toán chất lượng thu thập dữ liệu Bronze (Grain: source_name, data_date)"
+        columns:
+          - name: source_name
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['open-meteo', 'nsmo', 'evn_hydro', 'evn']
+          - name: data_date
+            tests:
+              - not_null
+          - name: status
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['VALID', 'INCOMPLETE', 'EMPTY', 'FAILED', 'EXHAUSTED']
+
+  - name: silver
+    database: iceberg
+    schema: silver
+    tables:
+      - name: dim_grid_entities
+        description: "Master Entity Resolution mapping (mã định danh chuẩn jc_entity_id)"
+        columns:
+          - name: jc_entity_id
+            tests:
+              - unique
+              - not_null
+          - name: region_code
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['NORTH', 'CENTRAL', 'SOUTH', 'UNMAPPED']
+      - name: hydro_reservoir_daily
+      - name: weather_daily
+      - name: grid_load_daily
+      - name: evn_daily_operations
+        columns:
+          - name: evidence_status
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['VERIFIED', 'UNVERIFIABLE']
+
+models:
+  - name: mart_entity_360
+    description: "Hồ sơ thực thể 360 độ (Entity Resolution 360 Profile) kết hợp Thủy điện, Thời tiết và Miền điện lực theo mã jc_entity_id"
+    columns:
+      - name: jc_entity_id
+        tests:
+          - unique
+          - not_null
+  - name: mart_sla_compliance
+    description: "Bảng giám sát SLA Chất lượng dữ liệu (Độ chính xác, Độ đầy đủ, Độ mới & Unit Cost)"
+    columns:
+      - name: source_name
+        tests:
+          - unique
+          - not_null

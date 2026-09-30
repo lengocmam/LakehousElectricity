@@ -1,0 +1,12 @@
+trino_iceberg:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      user: trino
+      host: trino
+      port: 8080
+      database: iceberg
+      schema: gold
+      threads: 4

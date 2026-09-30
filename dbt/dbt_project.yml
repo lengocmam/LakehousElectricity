@@ -1,0 +1,14 @@
+name: 'electricity_lakehouse_dbt'
+version: '1.0.0'
+config-version: 2
+
+profile: 'trino_iceberg'
+
+model-paths: ["models"]
+test-paths: ["tests"]
+
+models:
+  electricity_lakehouse_dbt:
+    marts:
+      +materialized: table
+      +schema: gold
