@@ -12,6 +12,10 @@ from pyspark.sql.types import (
 )
 
 from bronze.open_meteo import LOCATIONS
+from silver.llm_evidence_judge import (
+    extract_sentence_around_match,
+    verify_extraction_with_evidence,
+)
 from silver.silver_utils import (
     PROVINCE_TO_REGION,
     SILVER_NAMESPACE,
@@ -413,18 +417,26 @@ def transform_evn_silver(spark: SparkSession, processed_at: str) -> None:
         hydro_kwh = _parse_vn_float(hydro_m.group(1)) if hydro_m else None
         coal_kwh = _parse_vn_float(coal_m.group(1)) if coal_m else None
 
-        evidence_status = (
-            "VERIFIED"
-            if (peak_mw is not None or daily_kwh is not None)
-            else "UNVERIFIABLE"
+        primary_match = peak_m or energy_m
+        evidence_quote = (
+            extract_sentence_around_match(text, primary_match.start(), primary_match.end())
+            if primary_match
+            else None
+        )
+
+        evidence_status, _ = verify_extraction_with_evidence(
+            raw_text=text,
+            peak_mw=peak_mw,
+            daily_kwh=daily_kwh,
+            evidence_quote=evidence_quote,
         )
 
         silver_rows.append({
             "data_date": str(d_str),
-            "peak_capacity_mw": peak_mw,
-            "daily_energy_million_kwh": daily_kwh,
-            "hydro_energy_million_kwh": hydro_kwh,
-            "coal_energy_million_kwh": coal_kwh,
+            "peak_capacity_mw": peak_mw if evidence_status == "VERIFIED" else None,
+            "daily_energy_million_kwh": daily_kwh if evidence_status == "VERIFIED" else None,
+            "hydro_energy_million_kwh": hydro_kwh if evidence_status == "VERIFIED" else None,
+            "coal_energy_million_kwh": coal_kwh if evidence_status == "VERIFIED" else None,
             "evidence_status": evidence_status,
             "source_url": row["source_url"],
             "bronze_key": b_key,
